@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LinkedIn Scheduler</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="container">
+
+    <!-- HEADER -->
+    <header>
+        <div>
+            <h1>LinkedIn Scheduler</h1>
+            <p>Schedule and manage your LinkedIn posts</p>
+        </div>
+
+        <div class="connection">
+            {% if linkedin_account %}
+                <span class="dot"></span>
+                LinkedIn Connected
+
+                <form action="/auth/linkedin/disconnect" method="POST" style="display:inline;">
+                    <button type="submit" class="disconnect">
+                        Disconnect
+                    </button>
+                </form>
+            {% else %}
+                <a href="/auth/linkedin" class="connect-linkedin">
+                    Connect LinkedIn
+                </a>
+            {% endif %}
+        </div>
+    </header>
+
+    <!-- STATISTICS -->
+    <div class="stats">
+        <div class="stat">
+            <div class="stat-number">{{ total }}</div>
+            <div class="stat-label">Total</div>
+        </div>
+
+        <div class="stat">
+            <div class="stat-number yellow">{{ scheduled }}</div>
+            <div class="stat-label">Scheduled</div>
+        </div>
+
+        <div class="stat">
+            <div class="stat-number green">{{ published }}</div>
+            <div class="stat-label">Published</div>
+        </div>
+
+        <div class="stat">
+            <div class="stat-number red">{{ failed }}</div>
+            <div class="stat-label">Failed</div>
+        </div>
+    </div>
+
+    <!-- CREATE POST -->
+    <div class="card">
+        <h2>Schedule a Post</h2>
+        <form action="/schedule" method="POST">
+            <label>Post content</label>
+            <textarea name="content" placeholder="What do you want to post on LinkedIn?" required></textarea>
+
+            <label>Schedule date and time</label>
+            <input type="datetime-local" name="scheduled_at" required>
+
+            <button type="submit">Schedule Post</button>
+        </form>
+    </div>
+
+    <!-- POSTS LIST -->
+    <div class="card">
+        <div class="posts-header">
+            <h2>Your Posts</h2>
+            <span>{{ total }} posts</span>
+        </div>
+
+        {% if posts %}
+            {% for post in posts %}
+            <div class="post">
+                <div class="post-text">
+                    {{ post.content }}
+                </div>
+
+                <div class="post-bottom">
+                    <div>
+                        <strong>Scheduled:</strong>
+                        {{ post.scheduled_at.strftime("%d %b %Y, %I:%M %p") }}
+                    </div>
+
+                    <div class="status {{ post.status }}">
+                        {% if post.status == "scheduled" %}
+                            🟡 Scheduled
+                        {% elif post.status == "published" %}
+                            🟢 Published
+                        {% elif post.status == "failed" %}
+                            🔴 Failed
+                        {% else %}
+                            🔵 {{ post.status }}
+                        {% endif %}
+                    </div>
+
+                    {% if post.published_at %}
+                    <div>
+                        Published: {{ post.published_at.strftime("%d %b %Y, %I:%M %p") }}
+                    </div>
+                    {% endif %}
+
+                    {% if post.error_message %}
+                    <div class="error">
+                        Error: {{ post.error_message }}
+                    </div>
+                    {% endif %}
+
+                    {% if post.status == "scheduled" %}
+                    <form action="/delete/{{ post.id }}" method="POST">
+                        <button class="delete" type="submit">Delete</button>
+                    </form>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="empty">
+                No posts scheduled yet.
+            </div>
+        {% endif %}
+    </div>
+
+</div>
+
+</body>
+</html>
