@@ -10,10 +10,12 @@ from flask import (
     render_template,
     request,
     redirect,
-    url_for
+    url_for,
+    jsonify
 )
 
 from flask_sqlalchemy import SQLAlchemy
+from ai_service import generate_post
 
 
 # =====================================================
@@ -41,6 +43,13 @@ STATIC_DIR = os.path.join(
     "static"
 )
 
+UPLOAD_FOLDER = os.path.join(
+    STATIC_DIR,
+    "uploads"
+)
+
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
+
 
 # =====================================================
 # FLASK APP
@@ -52,6 +61,10 @@ app = Flask(
     static_folder=STATIC_DIR
 )
 
+# 5 MB maximum file upload size
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
 
 # =====================================================
 # DATABASE
@@ -62,7 +75,8 @@ DATABASE_PATH = os.path.join(
     "database.db"
 )
 
-app.config["SQLALCHEMY_DATABASE_URI"] = (
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
+    "DATABASE_URI",
     "sqlite:///" + DATABASE_PATH
 )
 
@@ -106,6 +120,12 @@ class Post(db.Model):
     error_message = db.Column(db.Text, nullable=True)
     published_at = db.Column(db.DateTime, nullable=True)
 
+    # Media support fields
+    image_path = db.Column(db.String(255), nullable=True)
+    media_type = db.Column(db.String(50), nullable=True)
+    media_status = db.Column(db.String(50), nullable=True)
+    linkedin_media_id = db.Column(db.String(255), nullable=True)
+
 
 # =====================================================
 # LINKEDIN ACCOUNT MODEL
@@ -129,6 +149,48 @@ class OAuthState(db.Model):
 
 
 # =====================================================
+# IMAGE UPLOAD VALIDATION HELPER
+# =====================================================
+
+def validate_and_save_image(file):
+    """
+    Validates the uploaded image both by extension and file signature (magic bytes),
+    enforces a safe generated filename, and saves it into the uploads folder.
+    Returns: (relative_image_path, media_type, error_message)
+    """
+    if not file or file.filename == "":
+        return None, None, None
+
+    filename = file.filename
+    if "." not in filename:
+        return None, None, "File must have an image extension (.jpg, .jpeg, or .png)."
+
+    ext = filename.rsplit(".", 1)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return None, None, "Unsupported file format. Only JPG, JPEG, and PNG images are allowed."
+
+    # Validate file magic bytes (file signature)
+    header = file.read(16)
+    file.seek(0)
+
+    is_jpeg = header.startswith(b"\xff\xd8\xff")
+    is_png = header.startswith(b"\x89PNG\r\n\x1a\n")
+
+    if not (is_jpeg or is_png):
+        return None, None, "Invalid image content. File signature does not match a valid JPG or PNG."
+
+    # Generate safe random filename to prevent path traversal and collisions
+    safe_filename = f"{secrets.token_hex(16)}.{ext}"
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    save_path = os.path.join(UPLOAD_FOLDER, safe_filename)
+    file.save(save_path)
+
+    media_type = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+    relative_path = f"uploads/{safe_filename}"
+    return relative_path, media_type, None
+
+
+# =====================================================
 # DASHBOARD
 # =====================================================
 
@@ -140,6 +202,9 @@ def dashboard():
     published = Post.query.filter_by(status="published").count()
     failed = Post.query.filter_by(status="failed").count()
 
+    media_count = Post.query.filter(Post.image_path.isnot(None)).count()
+    text_count = Post.query.filter(Post.image_path.is_(None)).count()
+
     linkedin_account = LinkedInAccount.query.first()
 
     return render_template(
@@ -149,6 +214,8 @@ def dashboard():
         scheduled=scheduled,
         published=published,
         failed=failed,
+        media_count=media_count,
+        text_count=text_count,
         linkedin_account=linkedin_account
     )
 
@@ -161,6 +228,7 @@ def dashboard():
 def schedule_post():
     content = request.form.get("content", "").strip()
     scheduled_at = request.form.get("scheduled_at", "").strip()
+    image_file = request.files.get("image")
 
     if not content or not scheduled_at:
         return redirect("/")
@@ -170,10 +238,23 @@ def schedule_post():
     except ValueError:
         return '<h2>Invalid date/time</h2><a href="/">Back to dashboard</a>'
 
+    image_path = None
+    media_type = None
+    media_status = None
+
+    if image_file and image_file.filename.strip():
+        image_path, media_type, error = validate_and_save_image(image_file)
+        if error:
+            return f'<h2>Image Upload Error</h2><p>{error}</p><a href="/">Back to dashboard</a>', 400
+        media_status = "attached"
+
     post = Post(
         content=content,
         scheduled_at=scheduled_datetime,
-        status="scheduled"
+        status="scheduled",
+        image_path=image_path,
+        media_type=media_type,
+        media_status=media_status
     )
 
     db.session.add(post)
@@ -189,9 +270,40 @@ def schedule_post():
 @app.route("/delete/<int:post_id>", methods=["POST"])
 def delete_post(post_id):
     post = Post.query.get_or_404(post_id)
+
+    # Safely remove uploaded image file if present
+    if post.image_path:
+        full_path = os.path.join(STATIC_DIR, post.image_path)
+        try:
+            if os.path.exists(full_path):
+                os.remove(full_path)
+        except OSError:
+            pass
+
     db.session.delete(post)
     db.session.commit()
     return redirect("/")
+
+
+# =====================================================
+# AI POST GENERATION API
+# =====================================================
+
+@app.route("/api/generate-post", methods=["POST"])
+def api_generate_post():
+    data = request.get_json(silent=True) or {}
+    keywords = data.get("keywords", "").strip()
+    tone = data.get("tone", "Professional").strip()
+
+    if not keywords:
+        return jsonify({
+            "success": False,
+            "error": "Please provide keywords or rough ideas to generate a post."
+        }), 400
+
+    result = generate_post(keywords=keywords, tone=tone)
+    status_code = 200 if result.get("success") else 400
+    return jsonify(result), status_code
 
 
 # =====================================================
@@ -376,13 +488,28 @@ def test_linkedin_post():
     return f'<h2>LinkedIn Post Failed ({response.status_code})</h2><pre>{response.text}</pre><a href="/">Back to dashboard</a>'
 
 
-# =====================================================
-# DATABASE INITIALIZATION
-# =====================================================
-
 def initialize_database():
     with app.app_context():
         db.create_all()
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        # Verify and apply schema migrations for existing SQLite database
+        try:
+            with db.engine.connect() as conn:
+                cursor = conn.connection.cursor()
+                cursor.execute("PRAGMA table_info(post)")
+                existing_cols = {row[1] for row in cursor.fetchall()}
+                new_columns = [
+                    ("image_path", "VARCHAR(255)"),
+                    ("media_type", "VARCHAR(50)"),
+                    ("media_status", "VARCHAR(50)"),
+                    ("linkedin_media_id", "VARCHAR(255)")
+                ]
+                for col_name, col_type in new_columns:
+                    if col_name not in existing_cols:
+                        cursor.execute(f"ALTER TABLE post ADD COLUMN {col_name} {col_type}")
+                conn.connection.commit()
+        except Exception as e:
+            print(f"Database migration notice: {e}")
 
 
 # =====================================================

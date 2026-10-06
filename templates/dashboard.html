@@ -40,6 +40,7 @@
         <div class="stat">
             <div class="stat-number">{{ total }}</div>
             <div class="stat-label">Total</div>
+            <div class="stat-sub">{{ text_count }} Text &bull; {{ media_count }} Media</div>
         </div>
 
         <div class="stat">
@@ -61,14 +62,87 @@
     <!-- CREATE POST -->
     <div class="card">
         <h2>Schedule a Post</h2>
-        <form action="/schedule" method="POST">
-            <label>Post content</label>
-            <textarea name="content" placeholder="What do you want to post on LinkedIn?" required></textarea>
 
-            <label>Schedule date and time</label>
-            <input type="datetime-local" name="scheduled_at" required>
+        <!-- AI POST ASSISTANT -->
+        <div class="ai-assistant-box">
+            <div class="ai-assistant-header">
+                <span class="ai-badge">✨ AI Post Assistant</span>
+                <span class="ai-note">Optional - Draft a post from keywords</span>
+            </div>
 
-            <button type="submit">Schedule Post</button>
+            <div class="ai-form-group">
+                <label for="ai-keywords">Ideas / Keywords</label>
+                <input
+                    type="text"
+                    id="ai-keywords"
+                    placeholder="e.g. internship, data analytics, machine learning, first project, learning"
+                    autocomplete="off"
+                >
+            </div>
+
+            <div class="ai-controls-row">
+                <div class="ai-tone-group">
+                    <label for="ai-tone">Tone</label>
+                    <select id="ai-tone">
+                        <option value="Professional" selected>Professional</option>
+                        <option value="Casual">Casual</option>
+                        <option value="Technical">Technical</option>
+                        <option value="Celebratory">Celebratory</option>
+                    </select>
+                </div>
+
+                <div class="ai-action-group">
+                    <button type="button" id="btn-generate-ai" class="btn-ai">
+                        <span id="ai-btn-text">Generate Post</span>
+                    </button>
+                    <button type="button" id="btn-regenerate-ai" class="btn-ai-secondary" style="display: none;">
+                        Regenerate
+                    </button>
+                </div>
+            </div>
+
+            <!-- AI Status / Feedback Message -->
+            <div id="ai-feedback" class="ai-feedback" style="display: none;"></div>
+        </div>
+
+        <!-- MAIN SCHEDULE FORM -->
+        <form action="/schedule" method="POST" enctype="multipart/form-data" id="post-schedule-form">
+            <label for="post-content">Post content</label>
+            <textarea
+                id="post-content"
+                name="content"
+                placeholder="What do you want to post on LinkedIn? (or generate draft above)"
+                required
+            ></textarea>
+
+            <!-- IMAGE ATTACHMENT (FEATURE 1) -->
+            <label for="image-upload">Image (optional)</label>
+            <div class="image-upload-wrapper">
+                <input
+                    type="file"
+                    id="image-upload"
+                    name="image"
+                    accept=".jpg,.jpeg,.png,image/jpeg,image/png"
+                    class="file-input"
+                >
+                <div class="file-hint">Supported formats: JPG, JPEG, PNG (Max 5MB)</div>
+
+                <!-- Client-side Error Message -->
+                <div id="image-client-error" class="client-error" style="display: none;"></div>
+
+                <!-- Image Preview Box -->
+                <div id="image-preview-container" class="image-preview-container" style="display: none;">
+                    <img id="image-preview-img" src="" alt="Selected image preview">
+                    <button type="button" id="btn-remove-image" class="btn-remove-image">
+                        ✕ Remove Image
+                    </button>
+                </div>
+            </div>
+
+            <label for="scheduled-at">Schedule date and time</label>
+            <input type="datetime-local" id="scheduled-at" name="scheduled_at" required>
+
+            <button type="submit" id="submit-schedule-btn">Schedule Post</button>
         </form>
     </div>
 
@@ -86,12 +160,28 @@
                     {{ post.content }}
                 </div>
 
+                {% if post.image_path %}
+                <div class="post-media-container">
+                    <img src="{{ url_for('static', filename=post.image_path) }}" alt="Post image attachment" class="post-image-thumbnail">
+                </div>
+                {% endif %}
+
                 <div class="post-bottom">
                     <div>
                         <strong>Scheduled:</strong>
                         {{ post.scheduled_at.strftime("%d %b %Y, %I:%M %p") }}
                     </div>
 
+                    <!-- Post Type Badge -->
+                    <div class="post-type-tag {% if post.image_path %}type-image{% else %}type-text{% endif %}">
+                        {% if post.image_path %}
+                            📷 Image Post
+                        {% else %}
+                            📝 Text Post
+                        {% endif %}
+                    </div>
+
+                    <!-- Post Status Badge -->
                     <div class="status {{ post.status }}">
                         {% if post.status == "scheduled" %}
                             🟡 Scheduled
@@ -117,7 +207,7 @@
                     {% endif %}
 
                     {% if post.status == "scheduled" %}
-                    <form action="/delete/{{ post.id }}" method="POST">
+                    <form action="/delete/{{ post.id }}" method="POST" style="margin-left: auto;">
                         <button class="delete" type="submit">Delete</button>
                     </form>
                     {% endif %}
@@ -133,5 +223,7 @@
 
 </div>
 
+<!-- Interactive Client-side Script -->
+<script src="{{ url_for('static', filename='main.js') }}"></script>
 </body>
 </html>
