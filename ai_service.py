@@ -40,7 +40,8 @@ def generate_with_gemini(api_key: str, keywords: str, tone: str) -> dict:
     }
 
     try:
-        response = requests.post(url, json=payload, timeout=25)
+        # Increased timeout to 60 seconds to prevent Render connection dropouts
+        response = requests.post(url, json=payload, timeout=60)
     except requests.RequestException as e:
         return {"success": False, "error": f"Failed to connect to Gemini API: {str(e)}"}
 
@@ -93,7 +94,8 @@ def generate_with_openai(api_key: str, keywords: str, tone: str) -> dict:
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=25)
+        # Increased timeout to 60 seconds
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
     except requests.RequestException as e:
         return {"success": False, "error": f"Failed to connect to OpenAI API: {str(e)}"}
 
