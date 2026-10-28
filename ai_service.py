@@ -38,12 +38,12 @@ def generate_post(keywords: str, tone: str = "Professional") -> dict:
     prompt = build_prompt(keywords, tone)
 
     try:
-        # Initialize the official Google GenAI client cleanly
+        # Initialize the official Google GenAI client
         client = genai.Client(api_key=api_key)
 
-        # Use the exact model mandated by Google's API response
+        # Use the universal gemini-flash-latest alias
         response = client.models.generate_content(
-            model="gemini-3.8-flash",
+            model="gemini-flash-latest",
             contents=prompt,
         )
 
