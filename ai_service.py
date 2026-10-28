@@ -24,7 +24,7 @@ CRITICAL RULES:
 
 
 def generate_with_gemini(api_key: str, keywords: str, tone: str) -> dict:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
     prompt = build_prompt(keywords, tone)
     payload = {
         "contents": [
