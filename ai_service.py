@@ -38,25 +38,23 @@ def generate_post(keywords: str, tone: str = "Professional") -> dict:
 
     prompt = build_prompt(keywords, tone)
 
-    # List of models to try in order of preference
-    models_to_try = ["gemini-3.8-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
-    last_error = ""
+    try:
+        # Initialize client with stable v1 API
+        client = genai.Client(
+            api_key=api_key,
+            http_options=HttpOptions(api_version="v1")
+        )
 
-    client = genai.Client(
-        api_key=api_key,
-        http_options=HttpOptions(api_version="v1")
-    )
+        # Use the standard current flash model
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
 
-    for model_name in models_to_try:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            if response and response.text:
-                return {"success": True, "post": response.text.strip()}
-        except Exception as e:
-            last_error = str(e)
-            continue  # Try the next model if one fails or is overloaded
+        if not response or not response.text:
+            return {"success": False, "error": "Gemini API returned empty text."}
 
-    return {"success": False, "error": f"Gemini API Error (All models busy): {last_error}"}
+        return {"success": True, "post": response.text.strip()}
+
+    except Exception as e:
+        return {"success": False, "error": f"Gemini API Error: {str(e)}"}
