@@ -1,7 +1,6 @@
 import os
 from dotenv import load_dotenv
 from google import genai
-from google.genai.types import HttpOptions
 
 load_dotenv()
 
@@ -39,15 +38,12 @@ def generate_post(keywords: str, tone: str = "Professional") -> dict:
     prompt = build_prompt(keywords, tone)
 
     try:
-        # Initialize client with stable v1 API
-        client = genai.Client(
-            api_key=api_key,
-            http_options=HttpOptions(api_version="v1")
-        )
+        # Initialize the official Google GenAI client cleanly
+        client = genai.Client(api_key=api_key)
 
-        # Use the standard current flash model
+        # Use the exact model mandated by Google's API response
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             contents=prompt,
         )
 
