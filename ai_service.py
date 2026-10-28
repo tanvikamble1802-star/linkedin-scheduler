@@ -1,8 +1,10 @@
 import os
 from dotenv import load_dotenv
 from google import genai
+from google.genai.types import HttpOptions
 
 load_dotenv()
+
 
 def build_prompt(keywords: str, tone: str) -> str:
     return f"""You are a professional LinkedIn post assistant.
@@ -21,6 +23,7 @@ CRITICAL RULES:
 7. Return ONLY the drafted post text itself. Do not include introductory remarks, commentary, explanations, or enclosing quotes.
 """
 
+
 def generate_post(keywords: str, tone: str = "Professional") -> dict:
     keywords = (keywords or "").strip()
     if not keywords:
@@ -30,25 +33,28 @@ def generate_post(keywords: str, tone: str = "Professional") -> dict:
     if not api_key:
         return {
             "success": False,
-            "error": "AI service is not configured. Please set GEMINI_API_KEY in your environment variables."
+            "error": "AI service is not configured. Please set GEMINI_API_KEY in your environment variables.",
         }
 
     prompt = build_prompt(keywords, tone)
 
     try:
-        # Initialize the official client
-        client = genai.Client(api_key=api_key)
-        
-        # Use the standard gemini-1.5-flash model via official SDK
+        # Initialize client explicitly pointing to the stable v1 API
+        client = genai.Client(
+            api_key=api_key,
+            http_options=HttpOptions(api_version="v1")
+        )
+
+        # Generate content using gemini-2.5-flash
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            model="gemini-2.5-flash",
             contents=prompt,
         )
-        
+
         if not response or not response.text:
             return {"success": False, "error": "Gemini API returned empty text."}
 
         return {"success": True, "post": response.text.strip()}
-        
+
     except Exception as e:
         return {"success": False, "error": f"Gemini API Error: {str(e)}"}
