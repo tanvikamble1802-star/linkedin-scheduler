@@ -1,6 +1,6 @@
 import os
+import requests
 from dotenv import load_dotenv
-from google import genai
 
 load_dotenv()
 
@@ -32,25 +32,43 @@ def generate_post(keywords: str, tone: str = "Professional") -> dict:
     if not api_key:
         return {
             "success": False,
-            "error": "AI service is not configured. Please set GEMINI_API_KEY in your environment variables.",
+            "error": "AI service is not configured. Please set GEMINI_API_KEY in your environment variables."
         }
 
     prompt = build_prompt(keywords, tone)
+    
+    # Target models in priority order
+    candidate_models = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+    last_error_msg = ""
 
-    try:
-        # Initialize the official Google GenAI client
-        client = genai.Client(api_key=api_key)
+    for model_name in candidate_models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        payload = {
+            "contents": [
+                {
+                    "parts": [{"text": prompt}]
+                }
+            ]
+        }
 
-        # Use the universal gemini-flash-latest alias
-        response = client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=prompt,
-        )
+        try:
+            response = requests.post(url, json=payload, timeout=30)
+            data = response.json()
 
-        if not response or not response.text:
-            return {"success": False, "error": "Gemini API returned empty text."}
+            if response.status_code == 200:
+                try:
+                    generated_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    return {"success": True, "post": generated_text.strip()}
+                except (KeyError, IndexError):
+                    last_error_msg = "Received empty response structure from Gemini API."
+                    continue
 
-        return {"success": True, "post": response.text.strip()}
+            # If model is unavailable or returned error, capture message and attempt next model
+            error_data = data.get("error", {})
+            last_error_msg = error_data.get("message", f"HTTP {response.status_code}")
+            
+        except Exception as e:
+            last_error_msg = str(e)
+            continue
 
-    except Exception as e:
-        return {"success": False, "error": f"Gemini API Error: {str(e)}"}
+    return {"success": False, "error": f"AI Generation Failed: {last_error_msg}"}
