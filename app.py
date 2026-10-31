@@ -1,6 +1,7 @@
 import os
 import secrets
-from datetime import datetime
+import urllib.parse
+from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -11,9 +12,11 @@ from flask import (
     request,
     redirect,
     url_for,
-    jsonify
+    jsonify,
+    has_request_context
 )
 
+from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_sqlalchemy import SQLAlchemy
 from ai_service import generate_post
 
@@ -52,7 +55,7 @@ ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
 
 
 # =====================================================
-# FLASK APP
+# FLASK APP SETUP & PROXY FIX (Render Reverse Proxy)
 # =====================================================
 
 app = Flask(
@@ -61,13 +64,23 @@ app = Flask(
     static_folder=STATIC_DIR
 )
 
+# Render & cloud providers use reverse proxies terminating SSL
+# ProxyFix ensures request.scheme is 'https' and request.host uses X-Forwarded-Host
+app.wsgi_app = ProxyFix(
+    app.wsgi_app,
+    x_for=1,
+    x_proto=1,
+    x_host=1,
+    x_prefix=1
+)
+
 # 5 MB maximum file upload size
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 
 # =====================================================
-# DATABASE
+# DATABASE CONFIGURATION
 # =====================================================
 
 DATABASE_PATH = os.path.join(
@@ -86,16 +99,11 @@ db = SQLAlchemy(app)
 
 
 # =====================================================
-# LINKEDIN CONFIGURATION
+# LINKEDIN CONFIGURATION & DYNAMIC REDIRECT URI
 # =====================================================
 
 LINKEDIN_CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
 LINKEDIN_CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
-
-LINKEDIN_REDIRECT_URI = os.getenv(
-    "LINKEDIN_REDIRECT_URI",
-    "http://localhost:5000/auth/linkedin/callback"
-)
 
 LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
 LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
@@ -106,6 +114,85 @@ LINKEDIN_VERSION = os.getenv(
     "LINKEDIN_VERSION",
     "202607"
 )
+
+
+def get_linkedin_redirect_uri() -> str:
+    """
+    Dynamically computes the exact LinkedIn OAuth callback URL.
+    Prevents 'Tunnel Unavailable' and localhost callback errors in production by:
+    1. Detecting if the current request is running on a live remote host (e.g. *.onrender.com)
+       and bypassing any stale localhost or dead tunnel URLs saved in .env.
+    2. Using RENDER_EXTERNAL_URL if set in the Render environment.
+    3. Respecting explicit production LINKEDIN_REDIRECT_URI if configured.
+    4. Dynamically extracting scheme and host from request headers (X-Forwarded-Proto, X-Forwarded-Host).
+    5. Falling back to localhost only for local development.
+    """
+    configured_uri = (os.getenv("LINKEDIN_REDIRECT_URI") or "").strip()
+
+    is_configured_local_or_tunnel = any(
+        t in configured_uri.lower()
+        for t in ("localhost", "127.0.0.1", "localtunnel.me", "ngrok", "trycloudflare")
+    )
+
+    # 1. Check Render's built-in external URL variable
+    render_external_url = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+    if render_external_url:
+        target = render_external_url.rstrip("/")
+        if not target.endswith("/auth/linkedin/callback"):
+            target += "/auth/linkedin/callback"
+        # If configured_uri was empty or pointed to localhost/tunnel, use Render URL
+        if not configured_uri or is_configured_local_or_tunnel:
+            return target
+
+    # 2. Check general base URL variables
+    for env_var in ("BASE_URL", "APP_URL", "SERVER_URL"):
+        val = (os.getenv(env_var) or "").strip()
+        if val and not any(t in val.lower() for t in ("localhost", "127.0.0.1")):
+            target = val.rstrip("/")
+            if not target.endswith("/auth/linkedin/callback"):
+                target += "/auth/linkedin/callback"
+            if not configured_uri or is_configured_local_or_tunnel:
+                return target
+
+    # 3. Dynamic inspection from active Flask request headers
+    if has_request_context():
+        try:
+            req_host = (request.headers.get("X-Forwarded-Host") or request.host or "").strip()
+            req_proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "").strip()
+
+            is_req_local = any(t in req_host.lower() for t in ("localhost", "127.0.0.1"))
+
+            # If request is from a public/production host (like onrender.com)
+            if req_host and not is_req_local:
+                # Force HTTPS for non-local production hosts
+                proto = "https" if ("render.com" in req_host or not req_proto or req_proto == "http") else req_proto
+                return f"{proto}://{req_host}/auth/linkedin/callback"
+
+            # If running locally and user defined configured_uri
+            if is_req_local and configured_uri:
+                if not configured_uri.endswith("/auth/linkedin/callback"):
+                    configured_uri = configured_uri.rstrip("/") + "/auth/linkedin/callback"
+                return configured_uri
+
+            if is_req_local and req_host:
+                proto = req_proto or "http"
+                return f"{proto}://{req_host}/auth/linkedin/callback"
+        except Exception as e:
+            print(f"⚠️ Notice resolving dynamic redirect uri: {e}")
+
+    # 4. If explicit non-local configured URI was set in environment
+    if configured_uri and not is_configured_local_or_tunnel:
+        if not configured_uri.endswith("/auth/linkedin/callback"):
+            configured_uri = configured_uri.rstrip("/") + "/auth/linkedin/callback"
+        return configured_uri
+
+    # 5. Localhost fallback
+    if configured_uri:
+        if not configured_uri.endswith("/auth/linkedin/callback"):
+            configured_uri = configured_uri.rstrip("/") + "/auth/linkedin/callback"
+        return configured_uri
+
+    return "http://localhost:5000/auth/linkedin/callback"
 
 
 # =====================================================
@@ -125,6 +212,7 @@ class Post(db.Model):
     media_type = db.Column(db.String(50), nullable=True)
     media_status = db.Column(db.String(50), nullable=True)
     linkedin_media_id = db.Column(db.String(255), nullable=True)
+    linkedin_post_id = db.Column(db.String(255), nullable=True)
 
 
 # =====================================================
@@ -135,7 +223,10 @@ class LinkedInAccount(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     linkedin_id = db.Column(db.String(255), nullable=False)
     access_token = db.Column(db.Text, nullable=False)
-    connected_at = db.Column(db.DateTime, default=datetime.utcnow)
+    connected_at = db.Column(
+        db.DateTime,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
 
 
 # =====================================================
@@ -145,7 +236,10 @@ class LinkedInAccount(db.Model):
 class OAuthState(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     state = db.Column(db.String(255), nullable=False, unique=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(
+        db.DateTime,
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
 
 
 # =====================================================
@@ -191,7 +285,7 @@ def validate_and_save_image(file):
 
 
 # =====================================================
-# DASHBOARD
+# DASHBOARD ROUTE
 # =====================================================
 
 @app.route("/")
@@ -291,29 +385,43 @@ def delete_post(post_id):
 
 @app.route("/api/generate-post", methods=["POST"])
 def api_generate_post():
-    data = request.get_json(silent=True) or {}
-    keywords = data.get("keywords", "").strip()
-    tone = data.get("tone", "Professional").strip()
+    try:
+        data = request.get_json(silent=True) or {}
+        keywords = data.get("keywords", "").strip()
+        tone = data.get("tone", "Professional").strip()
 
-    if not keywords:
+        if not keywords:
+            return jsonify({
+                "success": False,
+                "error": "Please provide keywords or rough ideas to generate a post."
+            }), 400
+
+        result = generate_post(keywords=keywords, tone=tone)
+        status_code = 200 if result.get("success") else 400
+        return jsonify(result), status_code
+    except Exception as e:
         return jsonify({
             "success": False,
-            "error": "Please provide keywords or rough ideas to generate a post."
-        }), 400
-
-    result = generate_post(keywords=keywords, tone=tone)
-    status_code = 200 if result.get("success") else 400
-    return jsonify(result), status_code
+            "error": f"AI service error: {str(e)}"
+        }), 500
 
 
 # =====================================================
-# LINKEDIN CONNECT
+# LINKEDIN CONNECT (OAUTH START)
 # =====================================================
 
 @app.route("/auth/linkedin")
 def linkedin_login():
     if not LINKEDIN_CLIENT_ID or not LINKEDIN_CLIENT_SECRET:
         return '<h2>LinkedIn configuration error</h2><p>LINKEDIN_CLIENT_ID or LINKEDIN_CLIENT_SECRET missing in .env file.</p><a href="/">Back</a>'
+
+    # Prune expired states older than 15 minutes to keep DB clean
+    try:
+        fifteen_mins_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=15)
+        OAuthState.query.filter(OAuthState.created_at < fifteen_mins_ago).delete()
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
 
     state = secrets.token_urlsafe(32)
 
@@ -322,16 +430,18 @@ def linkedin_login():
     db.session.commit()
 
     scopes = "openid profile email w_member_social"
+    redirect_uri = get_linkedin_redirect_uri()
+    print(f"🔗 [LinkedIn OAuth] Initiating login with redirect_uri: {redirect_uri}", flush=True)
 
-    authorization_url = (
-        f"{LINKEDIN_AUTH_URL}"
-        f"?response_type=code"
-        f"&client_id={LINKEDIN_CLIENT_ID}"
-        f"&redirect_uri={LINKEDIN_REDIRECT_URI}"
-        f"&state={state}"
-        f"&scope={scopes.replace(' ', '%20')}"
-    )
+    params = {
+        "response_type": "code",
+        "client_id": LINKEDIN_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "scope": scopes
+    }
 
+    authorization_url = f"{LINKEDIN_AUTH_URL}?{urllib.parse.urlencode(params)}"
     return redirect(authorization_url)
 
 
@@ -356,13 +466,23 @@ def linkedin_callback():
     if not oauth_state:
         return '<h2>Security Error</h2><p>OAuth state validation failed.</p><a href="/">Back to dashboard</a>'
 
+    # Validate state is not expired (15 minutes)
+    now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    if oauth_state.created_at and (now_utc_naive - oauth_state.created_at).total_seconds() > 900:
+        db.session.delete(oauth_state)
+        db.session.commit()
+        return '<h2>Security Error</h2><p>OAuth session expired. Please connect again.</p><a href="/">Back to dashboard</a>'
+
+    redirect_uri = get_linkedin_redirect_uri()
+    print(f"🔗 [LinkedIn OAuth] Token exchange using redirect_uri: {redirect_uri}", flush=True)
+
     # 1. Exchange authorization code for access token
     token_data = {
         "grant_type": "authorization_code",
         "code": code,
         "client_id": LINKEDIN_CLIENT_ID,
         "client_secret": LINKEDIN_CLIENT_SECRET,
-        "redirect_uri": LINKEDIN_REDIRECT_URI
+        "redirect_uri": redirect_uri
     }
 
     try:
@@ -412,12 +532,12 @@ def linkedin_callback():
     if existing_account:
         existing_account.linkedin_id = linkedin_id
         existing_account.access_token = access_token
-        existing_account.connected_at = datetime.utcnow()
+        existing_account.connected_at = datetime.now(timezone.utc).replace(tzinfo=None)
     else:
         new_account = LinkedInAccount(
             linkedin_id=linkedin_id,
             access_token=access_token,
-            connected_at=datetime.utcnow()
+            connected_at=datetime.now(timezone.utc).replace(tzinfo=None)
         )
         db.session.add(new_account)
 
@@ -488,11 +608,43 @@ def test_linkedin_post():
     return f'<h2>LinkedIn Post Failed ({response.status_code})</h2><pre>{response.text}</pre><a href="/">Back to dashboard</a>'
 
 
+# =====================================================
+# CRON / BACKGROUND WORKER TRIGGER ENDPOINT
+# =====================================================
+
+@app.route("/cron/publish", methods=["GET", "POST"])
+def cron_publish():
+    """
+    HTTP endpoint for external cron services (cron-job.org, Render cron, etc.)
+    or manual testing to execute due post publishing.
+    """
+    try:
+        from scheduler import publish_due_posts
+        processed = publish_due_posts(app)
+        return jsonify({
+            "success": True,
+            "processed_posts": processed,
+            "timestamp": datetime.now().isoformat()
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# =====================================================
+# DATABASE & APSCHEDULER INITIALIZATION (LIFECYCLE)
+# =====================================================
+
 def initialize_database():
+    """
+    Ensures all database tables and required schema migrations are created.
+    Runs on both Gunicorn worker boot and direct script execution.
+    """
     with app.app_context():
         db.create_all()
         os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-        # Verify and apply schema migrations for existing SQLite database
         try:
             with db.engine.connect() as conn:
                 cursor = conn.connection.cursor()
@@ -502,20 +654,32 @@ def initialize_database():
                     ("image_path", "VARCHAR(255)"),
                     ("media_type", "VARCHAR(50)"),
                     ("media_status", "VARCHAR(50)"),
-                    ("linkedin_media_id", "VARCHAR(255)")
+                    ("linkedin_media_id", "VARCHAR(255)"),
+                    ("linkedin_post_id", "VARCHAR(255)")
                 ]
                 for col_name, col_type in new_columns:
                     if col_name not in existing_cols:
                         cursor.execute(f"ALTER TABLE post ADD COLUMN {col_name} {col_type}")
                 conn.connection.commit()
         except Exception as e:
-            print(f"Database migration notice: {e}")
+            print(f"Database migration notice: {e}", flush=True)
+
+
+# Initialize database automatically when module is loaded (Gunicorn / Flask)
+initialize_database()
+
+# Initialize APScheduler inside Gunicorn worker process lifecycle
+# (runs only once per worker, guarded by lock and reloader checks)
+try:
+    from scheduler import init_scheduler
+    init_scheduler(app, interval_seconds=15)
+except Exception as sched_err:
+    print(f"⚠️ Notice starting background scheduler: {sched_err}", flush=True)
 
 
 # =====================================================
-# START APPLICATION
+# START APPLICATION (LOCAL DEV)
 # =====================================================
 
 if __name__ == "__main__":
-    initialize_database()
-    app.run(debug=True)
+    app.run(debug=True, port=5000)

@@ -3,6 +3,7 @@ import io
 import shutil
 import tempfile
 import unittest
+import urllib.parse
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta
 
@@ -16,7 +17,7 @@ os.environ["LINKEDIN_CLIENT_ID"] = "test_client_id"
 os.environ["LINKEDIN_CLIENT_SECRET"] = "test_client_secret"
 os.environ["LINKEDIN_VERSION"] = "202607"
 
-from app import app, db, Post, LinkedInAccount, STATIC_DIR
+from app import app, db, Post, LinkedInAccount, OAuthState, STATIC_DIR, get_linkedin_redirect_uri
 from scheduler import publish_due_posts
 import ai_service
 
@@ -42,6 +43,7 @@ class LinkedInSchedulerTestSuite(unittest.TestCase):
             # Clear any records in test DB
             Post.query.delete()
             LinkedInAccount.query.delete()
+            OAuthState.query.delete()
 
             # Create dummy connected LinkedIn account
             account = LinkedInAccount(
@@ -61,6 +63,7 @@ class LinkedInSchedulerTestSuite(unittest.TestCase):
             db.session.rollback()
             Post.query.delete()
             LinkedInAccount.query.delete()
+            OAuthState.query.delete()
             db.session.commit()
 
     # -------------------------------------------------------------
@@ -367,6 +370,235 @@ class LinkedInSchedulerTestSuite(unittest.TestCase):
         self.assertEqual(processed_order[1], "Mid Post (20m ago)")
         self.assertEqual(processed_order[2], "Late Post (10m ago)")
 
+    # -------------------------------------------------------------
+    # TEST 11: OAuth login initiation and state creation
+    # -------------------------------------------------------------
+    def test_11_oauth_initiation_and_state(self):
+        res = self.client.get("/auth/linkedin")
+        self.assertEqual(res.status_code, 302)
+        location = res.headers.get("Location")
+        self.assertTrue(location.startswith("https://www.linkedin.com/oauth/v2/authorization?"))
+
+        parsed = urllib.parse.urlparse(location)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        self.assertEqual(params["client_id"][0], "test_client_id")
+        self.assertIn("w_member_social", params["scope"][0])
+        state = params["state"][0]
+
+        with app.app_context():
+            oauth_rec = OAuthState.query.filter_by(state=state).first()
+            self.assertIsNotNone(oauth_rec)
+
+    # -------------------------------------------------------------
+    # TEST 12: OAuth callback token exchange & profile storage
+    # -------------------------------------------------------------
+    @patch("requests.post")
+    @patch("requests.get")
+    def test_12_oauth_callback_success(self, mock_get, mock_post):
+        # 1. Initiate login to generate valid state in DB
+        res_init = self.client.get("/auth/linkedin")
+        parsed = urllib.parse.urlparse(res_init.headers.get("Location"))
+        state = urllib.parse.parse_qs(parsed.query)["state"][0]
+
+        # 2. Mock token exchange response
+        mock_tok = MagicMock()
+        mock_tok.status_code = 200
+        mock_tok.json.return_value = {
+            "access_token": "mock_new_access_token",
+            "expires_in": 5184000
+        }
+        mock_post.return_value = mock_tok
+
+        # 3. Mock profile response
+        mock_prof = MagicMock()
+        mock_prof.status_code = 200
+        mock_prof.json.return_value = {
+            "sub": "new_member_999",
+            "name": "Alex Tech"
+        }
+        mock_get.return_value = mock_prof
+
+        # 4. Trigger callback
+        res_cb = self.client.get(f"/auth/linkedin/callback?code=mock_code&state={state}")
+        self.assertEqual(res_cb.status_code, 302)
+
+        with app.app_context():
+            acc = LinkedInAccount.query.filter_by(linkedin_id="new_member_999").first()
+            self.assertIsNotNone(acc)
+            self.assertEqual(acc.access_token, "mock_new_access_token")
+
+            # State is cleanly deleted
+            st = OAuthState.query.filter_by(state=state).first()
+            self.assertIsNone(st)
+
+    # -------------------------------------------------------------
+    # TEST 13: OAuth callback failure (user cancellation / invalid state)
+    # -------------------------------------------------------------
+    def test_13_oauth_callback_denied_or_invalid(self):
+        res_err = self.client.get("/auth/linkedin/callback?error=user_cancelled_authorize&error_description=Denied")
+        self.assertEqual(res_err.status_code, 200)
+        self.assertIn(b"LinkedIn authorization failed", res_err.data)
+
+        res_bad_state = self.client.get("/auth/linkedin/callback?code=abc&state=nonexistent_state")
+        self.assertEqual(res_bad_state.status_code, 200)
+        self.assertIn(b"Security Error", res_bad_state.data)
+
+    # -------------------------------------------------------------
+    # TEST 14: Disconnect LinkedIn
+    # -------------------------------------------------------------
+    def test_14_oauth_disconnect(self):
+        res = self.client.post("/auth/linkedin/disconnect")
+        self.assertEqual(res.status_code, 302)
+        with app.app_context():
+            self.assertIsNone(LinkedInAccount.query.first())
+
+    # -------------------------------------------------------------
+    # TEST 15: Cron publish HTTP endpoint
+    # -------------------------------------------------------------
+    @patch("requests.post")
+    def test_15_cron_publish_endpoint(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 201
+        mock_resp.text = '{"id": "urn:li:share:cron"}'
+        mock_post.return_value = mock_resp
+
+        past_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M")
+        self.client.post("/schedule", data={
+            "content": "Post published through cron trigger",
+            "scheduled_at": past_time
+        })
+
+        res = self.client.get("/cron/publish")
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["processed_posts"], 1)
+
+    # -------------------------------------------------------------
+    # TEST 16: Interrupted / stale publishing recovery
+    # -------------------------------------------------------------
+    def test_16_stale_publishing_recovery(self):
+        ten_mins_ago = datetime.now() - timedelta(minutes=10)
+        with app.app_context():
+            interrupted_post = Post(
+                content="Post crashed midway during previous run",
+                scheduled_at=ten_mins_ago,
+                status="publishing"
+            )
+            db.session.add(interrupted_post)
+            db.session.commit()
+
+        publish_due_posts()
+
+        with app.app_context():
+            recovered = Post.query.filter_by(content="Post crashed midway during previous run").first()
+            self.assertEqual(recovered.status, "failed")
+            self.assertIn("interrupted or timed out", recovered.error_message)
+
+    # -------------------------------------------------------------
+    # TEST 17: Dynamic Redirect URI (Render env & Forwarded headers)
+    # -------------------------------------------------------------
+    def test_17_dynamic_redirect_uri_render_and_headers(self):
+        from app import get_linkedin_redirect_uri
+
+        # Case A: When RENDER_EXTERNAL_URL is set in environment
+        with patch.dict(os.environ, {"RENDER_EXTERNAL_URL": "https://linkedin-scheduler-prod.onrender.com"}):
+            uri = get_linkedin_redirect_uri()
+            self.assertEqual(uri, "https://linkedin-scheduler-prod.onrender.com/auth/linkedin/callback")
+
+        # Case B: Behind Render reverse proxy via request headers, even if .env has localhost
+        with patch.dict(os.environ, {
+            "LINKEDIN_REDIRECT_URI": "http://localhost:5000/auth/linkedin/callback",
+            "RENDER_EXTERNAL_URL": ""
+        }):
+            # Simulate a request from a live Render host
+            with app.test_request_context(
+                "/auth/linkedin",
+                headers={
+                    "X-Forwarded-Host": "my-cool-app.onrender.com",
+                    "X-Forwarded-Proto": "https"
+                }
+            ):
+                uri = get_linkedin_redirect_uri()
+                self.assertEqual(uri, "https://my-cool-app.onrender.com/auth/linkedin/callback")
+
+    # -------------------------------------------------------------
+    # TEST 18: APScheduler Background Worker Lifecycle
+    # -------------------------------------------------------------
+    def test_18_apscheduler_initialization_and_lifecycle(self):
+        from scheduler import init_scheduler, shutdown_scheduler
+
+        # Test initializing the background scheduler
+        sched = init_scheduler(app, interval_seconds=10)
+        self.assertIsNotNone(sched)
+        self.assertTrue(sched.running)
+
+        # Check job is registered
+        jobs = [j.id for j in sched.get_jobs()]
+        self.assertIn("publish_due_posts_job", jobs)
+
+    # -------------------------------------------------------------
+    # TEST 19: AI Service candidate model fallback (404/503 handling)
+    # -------------------------------------------------------------
+    @patch("ai_service.genai.Client")
+    def test_19_ai_service_candidate_models_fallback(self, mock_client_cls):
+        from google.genai.errors import ClientError, ServerError
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+
+        # Mock first candidate ("gemini-3.8-flash") raising 503 ServerError
+        err_503 = ServerError(503, {"error": {"message": "High demand"}}, None)
+        # Mock second candidate ("gemini-2.5-flash") raising 404 ClientError
+        err_404 = ClientError(404, {"error": {"message": "Model not available"}}, None)
+        # Mock third candidate ("gemini-1.5-flash") raising 404 ClientError
+        err_15 = ClientError(404, {"error": {"message": "Model not found"}}, None)
+
+        # Mock fourth candidate succeeding
+        mock_resp_success = MagicMock()
+        mock_resp_success.text = "Crafted LinkedIn post demonstrating resilient fallback architecture."
+
+        mock_client.models.generate_content.side_effect = [
+            err_503,
+            err_404,
+            err_15,
+            mock_resp_success
+        ]
+
+        result = ai_service.generate_with_gemini(
+            api_key="mock_key",
+            keywords="resilient fallback architecture",
+            tone="Technical"
+        )
+
+        self.assertTrue(result["success"])
+        self.assertIn("resilient fallback architecture", result["post"])
+        # Verify it iterated through candidates
+        self.assertEqual(mock_client.models.generate_content.call_count, 4)
+
+    # -------------------------------------------------------------
+    # TEST 20: AI Service all candidates failed -> graceful clean error
+    # -------------------------------------------------------------
+    @patch("ai_service.genai.Client")
+    def test_20_ai_service_all_candidates_failed_graceful_response(self, mock_client_cls):
+        from google.genai.errors import ServerError
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.models.generate_content.side_effect = ServerError(503, {"error": {"message": "Busy"}}, None)
+
+        result = ai_service.generate_with_gemini(
+            api_key="mock_key",
+            keywords="machine learning",
+            tone="Professional"
+        )
+
+        # Must not raise an exception, must return clean failure dict
+        self.assertFalse(result["success"])
+        self.assertIn("AI service temporarily unavailable", result["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

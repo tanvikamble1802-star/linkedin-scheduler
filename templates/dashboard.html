@@ -17,18 +17,20 @@
             <p>Schedule and manage your LinkedIn posts</p>
         </div>
 
-        <div class="connection">
+        <div class="connection-wrapper">
             {% if linkedin_account %}
-                <span class="dot"></span>
-                LinkedIn Connected
+                <div class="connection">
+                    <span class="dot"></span>
+                    LinkedIn Connected
 
-                <form action="/auth/linkedin/disconnect" method="POST" style="display:inline;">
-                    <button type="submit" class="disconnect">
-                        Disconnect
-                    </button>
-                </form>
+                    <form action="/auth/linkedin/disconnect" method="POST" style="display:inline;">
+                        <button type="submit" class="disconnect">
+                            Disconnect
+                        </button>
+                    </form>
+                </div>
             {% else %}
-                <a href="/auth/linkedin" class="connect-linkedin">
+                <a href="/auth/linkedin" class="connect-linkedin" id="btn-connect-linkedin">
                     Connect LinkedIn
                 </a>
             {% endif %}

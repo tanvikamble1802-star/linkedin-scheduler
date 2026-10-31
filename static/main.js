@@ -35,16 +35,21 @@ document.addEventListener("DOMContentLoaded", function () {
                 body: JSON.stringify({ keywords, tone })
             });
 
-            const data = await response.json();
+            let data = null;
+            try {
+                data = await response.json();
+            } catch (jsonErr) {
+                // Ignore non-json parsing error
+            }
 
-            if (response.ok && data.success && data.post) {
+            if (response.ok && data && data.success && data.post) {
                 // Populate the existing Post Content textarea (user can freely edit)
                 postContent.value = data.post;
                 showAiFeedback("✨ Post drafted! You can edit or refine it in the box below before scheduling.", "success");
                 btnRegenerate.style.display = "inline-block";
                 postContent.focus();
             } else {
-                const errorMsg = data.error || "Unable to generate post. You can still write your post manually.";
+                const errorMsg = (data && data.error) || (response.status === 503 ? "AI service is currently busy. Please retry in a few moments." : "Unable to generate post. You can still write your post manually.");
                 showAiFeedback(`❌ ${errorMsg}`, "error");
             }
         } catch (err) {
